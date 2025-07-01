@@ -3,29 +3,28 @@
 use winapi::{
     shared::minwindef::{BOOL, DWORD, HINSTANCE, LPVOID, TRUE},
     um::{
-        handleapi::CloseHandle, libloaderapi::DisableThreadLibraryCalls,
-        processthreadsapi::CreateThread, winnt::DLL_PROCESS_ATTACH,
+        handleapi::CloseHandle,
+        libloaderapi::DisableThreadLibraryCalls,
+        processthreadsapi::CreateThread,
+        winnt::DLL_PROCESS_ATTACH,
     },
 };
 
 mod jvm;
 mod util;
 
-use jvm::hook::start;
-use util::logger::setup;
-
 #[unsafe(no_mangle)]
-pub extern "system" fn DllMain(h_module: HINSTANCE, reason: DWORD, _reserved: LPVOID) -> BOOL {
+pub extern "system" fn DllMain(module: HINSTANCE, reason: DWORD, _reserved: LPVOID) -> BOOL {
     match reason {
         DLL_PROCESS_ATTACH => {
             unsafe {
-                DisableThreadLibraryCalls(h_module);
-                setup();
+                DisableThreadLibraryCalls(module);
+                util::logger::init();
 
                 let thread = CreateThread(
                     std::ptr::null_mut(),
                     0,
-                    Some(hookthread),
+                    Some(main),
                     std::ptr::null_mut(),
                     0,
                     std::ptr::null_mut(),
@@ -41,14 +40,14 @@ pub extern "system" fn DllMain(h_module: HINSTANCE, reason: DWORD, _reserved: LP
     }
 }
 
-unsafe extern "system" fn hookthread(_param: LPVOID) -> DWORD {
-    match start() {
+unsafe extern "system" fn main(_param: LPVOID) -> DWORD {
+    match jvm::hook::start() {
         Ok(_) => {
-            println!("[+] JNI hook initialized successfully");
+            util::logger::success("Fracture initialized successfully");
             0
         }
         Err(e) => {
-            println!("[!] Failed to initialize JNI hook: {}", e);
+            util::logger::error(&format!("Failed to initialize: {}", e));
             1
         }
     }
