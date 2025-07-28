@@ -1,4 +1,4 @@
-pub type RegisterNativesFn = unsafe extern "system" fn(
+pub type RegisterNativesFn = unsafe extern "C" fn(
     env: *mut JniEnv,
     class: JClass,
     methods: *const JniNativeMethod,
