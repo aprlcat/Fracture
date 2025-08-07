@@ -1,7 +1,12 @@
-use std::{ffi::CStr, ptr, sync::Mutex, thread, time::Duration};
-
+use std::{ffi::CStr, sync::Mutex};
 use anyhow::Result;
-use libloading::{Library, Symbol};
+use winapi::{
+    shared::minwindef::HMODULE,
+    um::{
+        libloaderapi::{GetModuleHandleA, GetProcAddress},
+        synchapi::Sleep,
+    },
+};
 
 use super::*;
 use crate::util::{logger, trampoline};
@@ -10,8 +15,8 @@ static ORIGINAL: Mutex<Option<RegisterNativesFn>> = Mutex::new(None);
 
 pub fn start() -> Result<()> {
     unsafe {
-        let lib = wait_for_jvm()?;
-        let vm = get_vm(&lib)?;
+        let module = waitjvm()?;
+        let vm = getvm(module)?;
         let env = attach(vm)?;
         hook(env)?;
 
@@ -20,55 +25,48 @@ pub fn start() -> Result<()> {
     }
 }
 
-unsafe fn wait_for_jvm() -> Result<Library> {
-    let jvm_paths = [
-        "/System/Library/Frameworks/JavaVM.framework/Versions/Current/Libraries/libjvm.dylib",
-        "/Library/Internet Plug-Ins/JavaAppletPlugin.plugin/Contents/Home/lib/server/libjvm.dylib",
-        "/Library/Java/JavaVirtualMachines/*/Contents/Home/lib/server/libjvm.dylib",
-    ];
+unsafe fn waitjvm() -> Result<HMODULE> {
+    let mut module: HMODULE = std::ptr::null_mut();
 
-    loop {
-        if let Ok(lib) = Library::new("libjvm.dylib") {
-            logger::info("Found already loaded libjvm.dylib");
-            return Ok(lib);
-        }
-
-        for path in &jvm_paths {
-            if let Ok(lib) = Library::new(path) {
-                logger::info(&format!("Found JVM at {}", path));
-                return Ok(lib);
-            }
-        }
-
-        thread::sleep(Duration::from_millis(50));
+    while module.is_null() {
+        module = GetModuleHandleA(b"jvm.dll\0".as_ptr() as *const i8);
+        Sleep(50);
     }
+
+    logger::info(&format!("Found jvm.dll at {:p}", module));
+    Ok(module)
 }
 
-unsafe fn get_vm(lib: &Library) -> Result<*mut JavaVm> {
-    let get_created_vms: Symbol<unsafe extern "C" fn(*mut *mut JavaVm, JInt, *mut JInt) -> JInt> =
-        lib.get(b"JNI_GetCreatedJavaVMs\0")?;
+unsafe fn getvm(module: HMODULE) -> Result<*mut JavaVm> {
+    let getvms = GetProcAddress(module, b"JNI_GetCreatedJavaVMs\0".as_ptr() as *const i8);
 
-    let mut vm: *mut JavaVm = ptr::null_mut();
+    if getvms.is_null() {
+        return Err(anyhow::anyhow!("Could not find JNI_GetCreatedJavaVMs"));
+    }
+
+    let getvms: extern "system" fn(*mut *mut JavaVm, JInt, *mut JInt) -> JInt =
+        std::mem::transmute(getvms);
+
+    let mut vm: *mut JavaVm = std::ptr::null_mut();
     let mut count: JInt = 0;
 
-    if get_created_vms(&mut vm, 1, &mut count) != 0 || count == 0 {
+    if getvms(&mut vm, 1, &mut count) != 0 || count == 0 {
         return Err(anyhow::anyhow!("Could not get JavaVM pointer"));
     }
 
-    logger::info(&format!("Got JavaVM at {:p}", vm));
     Ok(vm)
 }
 
 unsafe fn attach(vm: *mut JavaVm) -> Result<*mut JniEnv> {
-    let attach_fn: unsafe extern "C" fn(
+    let attach: extern "system" fn(
         *mut JavaVm,
         *mut *mut JniEnv,
         *mut std::os::raw::c_void,
     ) -> JInt = std::mem::transmute(*(*vm).functions.offset(4) as *const std::os::raw::c_void);
 
-    let mut env: *mut JniEnv = ptr::null_mut();
+    let mut env: *mut JniEnv = std::ptr::null_mut();
 
-    if attach_fn(vm, &mut env, ptr::null_mut()) != 0 {
+    if attach(vm, &mut env, std::ptr::null_mut()) != 0 {
         return Err(anyhow::anyhow!("Could not attach to thread"));
     }
 
@@ -86,25 +84,22 @@ unsafe fn hook(env: *mut JniEnv) -> Result<()> {
     Ok(())
 }
 
-unsafe extern "C" fn hooked(
+unsafe extern "system" fn hooked(
     env: *mut JniEnv,
     class: JClass,
     methods: *const JniNativeMethod,
     count: JInt,
 ) -> JInt {
-    let classname = get_class_name(env, class).unwrap_or_else(|| "Unknown".to_string());
+    let classname = getclass(env, class).unwrap_or_else(|| "Unknown".to_string());
 
-    logger::hook(&format!(
-        "Class '{}' registering {} native methods",
-        classname, count
-    ));
+    logger::hook(&format!("Class '{}' registering {} native methods", classname, count));
 
     for i in 0..count {
         let method = &*methods.offset(i as isize);
         let name = CStr::from_ptr(method.name).to_string_lossy();
         let signature = CStr::from_ptr(method.signature).to_string_lossy();
-        let (module, offset) = get_module_info(method.function);
-        let readable = parse_signature(&signature, &name);
+        let (module, offset) = getmodule(method.function);
+        let readable = parsesig(&signature, &name);
 
         let info = format!(
             "  {} | {} | 0x{:X} | 0x{:016X}",
@@ -122,39 +117,34 @@ unsafe extern "C" fn hooked(
     }
 }
 
-unsafe fn get_class_name(env: *mut JniEnv, class: JClass) -> Option<String> {
+unsafe fn getclass(env: *mut JniEnv, class: JClass) -> Option<String> {
     if class.is_null() {
         return None;
     }
 
-    let find_class: unsafe extern "C" fn(*mut JniEnv, *const i8) -> JClass =
+    let findclass: extern "system" fn(*mut JniEnv, *const i8) -> JClass =
         std::mem::transmute(*(*env).functions.offset(6) as *const std::os::raw::c_void);
 
-    let get_method_id: unsafe extern "C" fn(
-        *mut JniEnv,
-        JClass,
-        *const i8,
-        *const i8,
-    ) -> JMethodId =
+    let getmethod: extern "system" fn(*mut JniEnv, JClass, *const i8, *const i8) -> JMethodId =
         std::mem::transmute(*(*env).functions.offset(33) as *const std::os::raw::c_void);
 
-    let call_object_method: unsafe extern "C" fn(*mut JniEnv, JObject, JMethodId) -> JObject =
+    let callmethod: extern "system" fn(*mut JniEnv, JObject, JMethodId) -> JObject =
         std::mem::transmute(*(*env).functions.offset(36) as *const std::os::raw::c_void);
 
-    let get_string_utf_chars: unsafe extern "C" fn(*mut JniEnv, JString, *mut u8) -> *const i8 =
+    let getstring: extern "system" fn(*mut JniEnv, JString, *mut u8) -> *const i8 =
         std::mem::transmute(*(*env).functions.offset(169) as *const std::os::raw::c_void);
 
-    let release_string_utf_chars: unsafe extern "C" fn(*mut JniEnv, JString, *const i8) =
+    let releasestring: extern "system" fn(*mut JniEnv, JString, *const i8) =
         std::mem::transmute(*(*env).functions.offset(170) as *const std::os::raw::c_void);
 
-    let class_class = find_class(env, b"java/lang/Class\0".as_ptr() as *const i8);
-    if class_class.is_null() {
+    let classclass = findclass(env, b"java/lang/Class\0".as_ptr() as *const i8);
+    if classclass.is_null() {
         return None;
     }
 
-    let method = get_method_id(
+    let method = getmethod(
         env,
-        class_class,
+        classclass,
         b"getName\0".as_ptr() as *const i8,
         b"()Ljava/lang/String;\0".as_ptr() as *const i8,
     );
@@ -163,55 +153,51 @@ unsafe fn get_class_name(env: *mut JniEnv, class: JClass) -> Option<String> {
         return None;
     }
 
-    let name_string = call_object_method(env, class, method);
-    if name_string.is_null() {
+    let namestring = callmethod(env, class, method);
+    if namestring.is_null() {
         return None;
     }
 
-    let utf_name = get_string_utf_chars(env, name_string, ptr::null_mut());
-    if utf_name.is_null() {
+    let utfname = getstring(env, namestring, std::ptr::null_mut());
+    if utfname.is_null() {
         return None;
     }
 
-    let result = CStr::from_ptr(utf_name).to_string_lossy().to_string();
-    release_string_utf_chars(env, name_string, utf_name);
+    let result = CStr::from_ptr(utfname).to_string_lossy().to_string();
+    releasestring(env, namestring, utfname);
 
     Some(result)
 }
 
-fn get_module_info(address: *mut std::os::raw::c_void) -> (String, usize) {
+fn getmodule(address: *mut std::os::raw::c_void) -> (String, usize) {
     unsafe {
-        use std::ffi::CStr;
+        use winapi::um::{
+            libloaderapi::{GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GetModuleHandleExA},
+            processthreadsapi::GetCurrentProcess,
+            psapi::GetModuleFileNameExA,
+        };
 
-        use mach2::dyld::{_dyld_get_image_header, _dyld_get_image_name, _dyld_image_count};
+        let mut module = std::ptr::null_mut();
 
-        let addr = address as usize;
-        let image_count = _dyld_image_count();
+        if GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            address as *const i8,
+            &mut module,
+        ) != 0
+        {
+            let mut path = [0i8; 260];
+            let result = GetModuleFileNameExA(GetCurrentProcess(), module, path.as_mut_ptr(), 260);
 
-        for i in 0..image_count {
-            let header = _dyld_get_image_header(i);
-            if header.is_null() {
-                continue;
-            }
-
-            let name_ptr = _dyld_get_image_name(i);
-            if name_ptr.is_null() {
-                continue;
-            }
-
-            let base_addr = header as usize;
-
-            // actually parse mach-o header later
-            if addr >= base_addr && addr < base_addr + 0x100000 {
-                let name = CStr::from_ptr(name_ptr).to_string_lossy();
-                let module_name = std::path::Path::new(&*name)
+            if result != 0 {
+                let pathstr = CStr::from_ptr(path.as_ptr()).to_string_lossy().to_string();
+                let modulename = std::path::Path::new(&pathstr)
                     .file_name()
-                    .and_then(|n| n.to_str())
+                    .and_then(|name| name.to_str())
                     .unwrap_or("Unknown")
                     .to_string();
 
-                let offset = addr - base_addr;
-                return (module_name, offset);
+                let offset = address as usize - module as usize;
+                return (modulename, offset);
             }
         }
 
@@ -219,20 +205,20 @@ fn get_module_info(address: *mut std::os::raw::c_void) -> (String, usize) {
     }
 }
 
-fn parse_signature(signature: &str, name: &str) -> String {
+fn parsesig(signature: &str, name: &str) -> String {
     let mut result = String::new();
 
-    let return_start = signature.find(')').map(|i| i + 1).unwrap_or(0);
-    let return_type = parse_type(&signature[return_start..]);
+    let returnstart = signature.find(')').map(|i| i + 1).unwrap_or(0);
+    let returntype = parsetype(&signature[returnstart..]);
 
-    result.push_str(&return_type);
+    result.push_str(&returntype);
     result.push(' ');
     result.push_str(name);
     result.push('(');
 
-    let param_start = signature.find('(').map(|i| i + 1).unwrap_or(0);
-    let param_end = signature.find(')').unwrap_or(signature.len());
-    let params = &signature[param_start..param_end];
+    let paramstart = signature.find('(').map(|i| i + 1).unwrap_or(0);
+    let paramend = signature.find(')').unwrap_or(signature.len());
+    let params = &signature[paramstart..paramend];
 
     let mut chars = params.chars().peekable();
     let mut first = true;
@@ -243,20 +229,20 @@ fn parse_signature(signature: &str, name: &str) -> String {
         }
         first = false;
 
-        let param_type = parse_type_chars(&mut chars);
-        result.push_str(&param_type);
+        let paramtype = parsetypechars(&mut chars);
+        result.push_str(&paramtype);
     }
 
     result.push(')');
     result
 }
 
-fn parse_type(sig: &str) -> String {
+fn parsetype(sig: &str) -> String {
     let mut chars = sig.chars().peekable();
-    parse_type_chars(&mut chars)
+    parsetypechars(&mut chars)
 }
 
-fn parse_type_chars(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
+fn parsetypechars(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
     match chars.next() {
         Some('V') => "void".to_string(),
         Some('Z') => "boolean".to_string(),
@@ -278,8 +264,8 @@ fn parse_type_chars(chars: &mut std::iter::Peekable<std::str::Chars>) -> String 
             classname
         }
         Some('[') => {
-            let base_type = parse_type_chars(chars);
-            format!("{}[]", base_type)
+            let basetype = parsetypechars(chars);
+            format!("{}[]", basetype)
         }
         _ => "unknown".to_string(),
     }
